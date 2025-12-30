@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import time
+import logging
 import http.client
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
@@ -23,16 +24,36 @@ deliver /.well-known/acme-challenge requests to this process.
 
 class ACMEHandler(SimpleHTTPRequestHandler):
     """Handle ACME challenges from Let's Encrypt."""
+    # populated at runtime from CLI args
+    allowed_lb_ips = set()
 
     def do_GET(self):
         """Serve challenge files from .well-known/acme-challenge/"""
+        start = time.time()
         # Deny any request that looks like it is trying to access private files
         deny_patterns = ('/certs', '/letsencrypt', '.pem', '/.git')
         for p in deny_patterns:
             if p in self.path:
                 self.send_response(404)
                 self.end_headers()
+                logging.getLogger('oci_lb_certbot').warning(
+                    "Denied access to %s from %s (pattern %s)", self.path, self.client_address[0], p
+                )
                 return
+
+        client_ip = self.client_address[0]
+        # If request comes from a configured load balancer IP, respond 200 for health checks
+        if client_ip in self.allowed_lb_ips:
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'OK')
+            elapsed = time.time() - start
+            logging.getLogger('oci_lb_certbot').info(
+                "%s %s %s -> %d (LB probe) %.3fs UA=%s",
+                client_ip, self.command, self.path, 200, elapsed, self.headers.get('User-Agent')
+            )
+            return
         if self.path.startswith('/.well-known/acme-challenge/'):
             file_path = Path('.') / self.path.lstrip('/')
             if file_path.exists():
@@ -45,10 +66,15 @@ class ACMEHandler(SimpleHTTPRequestHandler):
 
         self.send_response(404)
         self.end_headers()
+        elapsed = time.time() - start
+        logging.getLogger('oci_lb_certbot').info(
+            "%s %s %s -> %d %.3fs UA=%s",
+            self.client_address[0], self.command, self.path, 404, elapsed, self.headers.get('User-Agent')
+        )
 
     def log_message(self, format, *args):
-        """Log to stdout with timestamp."""
-        print(f"[{self.log_date_time_string()}] {format % args}")
+        """Log via logging module for compatibility with structured logging."""
+        logging.getLogger('oci_lb_certbot').info(f"[{self.log_date_time_string()}] {format % args}")
 
 
 def _ensure_challenge_dir(path: Path = Path('.')):
@@ -148,14 +174,18 @@ def wait_for_server(port: int = 8000, timeout: int = 120, interval: float = 2.0)
     Returns True if the server became reachable within timeout, False otherwise.
     """
     deadline = time.time() + timeout
-    print(f"Waiting up to {timeout}s for server on port {port} to become reachable...")
+    logger = logging.getLogger('oci_lb_certbot')
+    logger.info("Waiting up to %ds for server on port %d to become reachable...", timeout, port)
+    attempt = 0
     while time.time() < deadline:
+        attempt += 1
+        elapsed = int(time.time() - (deadline - timeout))
         try:
             conn = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
             conn.request('GET', '/')
             resp = conn.getresponse()
             # Any response (200/404/etc.) indicates the server is up
-            print(f"Server responded with status {resp.status}; proceeding shortly...")
+            logger.info("Server responded with status %d on attempt %d after %ds; continuing...", resp.status, attempt, elapsed)
             try:
                 conn.close()
             except Exception:
@@ -163,14 +193,16 @@ def wait_for_server(port: int = 8000, timeout: int = 120, interval: float = 2.0)
             # small grace period to let load balancer mark backend healthy
             grace = min(5, timeout)
             if grace > 0:
-                print(f"Waiting an additional {grace}s to allow load balancer to pick up the backend...")
+                logger.debug("Waiting an additional %ds to allow load balancer to pick up the backend...", grace)
                 time.sleep(grace)
+            logger.info("Server ready after %ds", elapsed)
             return True
         except Exception:
             # Not yet reachable; sleep and retry
+            logger.debug("Attempt %d: server not reachable yet (elapsed %ds)", attempt, int(time.time() - (deadline - timeout)))
             time.sleep(interval)
 
-    print(f"Timed out after {timeout}s waiting for server on port {port}; proceeding anyway.")
+    logger.warning("Timed out after %ds waiting for server on port %d; proceeding anyway.", timeout, port)
     return False
 
 
@@ -296,6 +328,8 @@ def parse_args(argv=None):
 
     srv = sub.add_parser('server', help='Run HTTP server to serve /.well-known')
     srv.add_argument('--port', '-p', type=int, default=8000, help='Port to listen on (default: 8000)')
+    srv.add_argument('--lb-ip', '-l', action='append', help='Load balancer IP addresses (can be repeated)')
+    srv.add_argument('--verbose', '-v', action='store_true', help='Enable debug logging')
 
     cert = sub.add_parser('cert', help='Obtain certificate with certbot (webroot)')
     cert.add_argument('--domain', '-d', required=True, help='Domain name')
@@ -305,6 +339,8 @@ def parse_args(argv=None):
     cert.add_argument('--output-dir', '-o', default='./certs', help='Directory to copy certs and store certbot config (default: ./certs)')
     cert.add_argument('--dry-run', action='store_true', help='Pass --dry-run to certbot (test)')
     cert.add_argument('--wait-seconds', type=int, default=120, help='Seconds to wait for server & LB to become ready before running certbot (default: 120)')
+    cert.add_argument('--lb-ip', '-l', action='append', help='Load balancer IP addresses (can be repeated)')
+    cert.add_argument('--verbose', '-v', action='store_true', help='Enable debug logging')
 
     return p.parse_args(argv)
 
@@ -312,11 +348,22 @@ def parse_args(argv=None):
 if __name__ == '__main__':
     args = parse_args()
 
+    # Configure logging
+    level = logging.DEBUG if getattr(args, 'verbose', False) else logging.INFO
+    logging.basicConfig(level=level, format='%(asctime)s %(levelname)s %(message)s')
+    logger = logging.getLogger('oci_lb_certbot')
+
+    # Set allowed LB IPs on the handler class
+    lb_ips = set((args.lb_ip or []) if hasattr(args, 'lb_ip') else [])
+    if lb_ips:
+        logger.info('Configured load balancer IPs: %s', ','.join(lb_ips))
+    ACMEHandler.allowed_lb_ips = lb_ips
+
     if args.command == 'server':
         start_server(port=args.port)
     elif args.command == 'cert':
         create_cert(domain=args.domain, email=args.email, webroot=args.webroot, port=args.port,
-                output_dir=args.output_dir, dry_run=bool(args.dry_run), wait_seconds=int(args.wait_seconds))
+                    output_dir=args.output_dir, dry_run=bool(args.dry_run), wait_seconds=int(args.wait_seconds))
     else:
         print('No command provided. Use "server" to run the challenge server or "cert" to obtain a certificate.')
         print('Examples:')
