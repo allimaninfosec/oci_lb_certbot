@@ -63,25 +63,51 @@ def _is_within(child: Path, parent: Path) -> bool:
     return parent_res == child_res or parent_res in child_res.parents
 
 
-def ensure_output_dir_safe(webroot: str, output_dir: str, allow_in_webroot: bool = False) -> Path:
-    """Ensure output_dir exists, is outside of webroot unless allowed, and has secure perms."""
+def ensure_output_dir_safe(webroot: str, output_dir: str, allow_in_webroot: bool = True) -> Path:
+    """Ensure output_dir exists and has secure perms.
+
+    By default we allow the output_dir to live inside the webroot (working
+    directory) because you asked for the certs to be placed in the working
+    directory. If creating the directory at the requested path fails due to
+    permissions, fall back to a per-user location in the home directory.
+    The function also attempts to set ownership to the running user (best
+    effort).
+    """
     webroot_p = Path(webroot).resolve()
     out_p = Path(output_dir).resolve()
 
+    # If the requested output dir is inside the webroot and that's allowed,
+    # keep it (user requested that behavior). Otherwise, the caller may pass
+    # allow_in_webroot=False to force moving it out.
     if _is_within(out_p, webroot_p) and not allow_in_webroot:
-        # Move to parent of webroot to keep it out of public files
         new_out = webroot_p.parent / 'certs'
         print(f"Warning: requested output dir {out_p} is inside webroot {webroot_p}. Using {new_out} instead.")
         out_p = new_out
 
-    out_p.mkdir(parents=True, exist_ok=True)
-    # Lock down directory permissions
+    try:
+        out_p.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        # Fallback to a user-writable location under the user's home directory
+        fallback = Path.home() / '.oci_lb_certbot' / 'certs'
+        print(f"Permission denied creating {out_p}; falling back to {fallback}")
+        fallback.mkdir(parents=True, exist_ok=True)
+        out_p = fallback
+
+    # Lock down directory permissions (best-effort)
     try:
         os.chmod(out_p, 0o700)
     except Exception:
-        # best-effort; continue if OS disallows
         pass
 
+    # Ensure ownership is the running user (best-effort)
+    try:
+        uid = os.getuid()
+        gid = os.getgid()
+        os.chown(out_p, uid, gid)
+    except Exception:
+        pass
+
+    print(f"Using output directory: {out_p}")
     return out_p
 
 
