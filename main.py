@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import time
+import http.client
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
@@ -141,8 +142,40 @@ def run_server_in_thread(port: int = 8000):
     return server, thread
 
 
+def wait_for_server(port: int = 8000, timeout: int = 120, interval: float = 2.0) -> bool:
+    """Wait up to `timeout` seconds for localhost:port to accept HTTP connections.
+
+    Returns True if the server became reachable within timeout, False otherwise.
+    """
+    deadline = time.time() + timeout
+    print(f"Waiting up to {timeout}s for server on port {port} to become reachable...")
+    while time.time() < deadline:
+        try:
+            conn = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
+            conn.request('GET', '/')
+            resp = conn.getresponse()
+            # Any response (200/404/etc.) indicates the server is up
+            print(f"Server responded with status {resp.status}; proceeding shortly...")
+            try:
+                conn.close()
+            except Exception:
+                pass
+            # small grace period to let load balancer mark backend healthy
+            grace = min(5, timeout)
+            if grace > 0:
+                print(f"Waiting an additional {grace}s to allow load balancer to pick up the backend...")
+                time.sleep(grace)
+            return True
+        except Exception:
+            # Not yet reachable; sleep and retry
+            time.sleep(interval)
+
+    print(f"Timed out after {timeout}s waiting for server on port {port}; proceeding anyway.")
+    return False
+
+
 def create_cert(domain: str, email: str, webroot: str = '.', port: int = 8000,
-                output_dir: str = './certs', dry_run: bool = False):
+                output_dir: str = './certs', dry_run: bool = False, wait_seconds: int = 120):
     """Request certificate from Let's Encrypt using certbot's webroot plugin.
 
     This function will start a temporary HTTP server on `port` to serve
@@ -155,6 +188,10 @@ def create_cert(domain: str, email: str, webroot: str = '.', port: int = 8000,
 
     print(f"Starting temporary HTTP server on port {port} to serve challenges...")
     server, thread = run_server_in_thread(port=port)
+
+    # Wait for the server/load balancer to become ready (user-configurable)
+    if wait_seconds and wait_seconds > 0:
+        wait_for_server(port=port, timeout=wait_seconds)
 
     cmd = [
         'certbot', 'certonly',
@@ -267,6 +304,7 @@ def parse_args(argv=None):
     cert.add_argument('--port', type=int, default=8000, help='Backend port the LB forwards to (default: 8000)')
     cert.add_argument('--output-dir', '-o', default='./certs', help='Directory to copy certs and store certbot config (default: ./certs)')
     cert.add_argument('--dry-run', action='store_true', help='Pass --dry-run to certbot (test)')
+    cert.add_argument('--wait-seconds', type=int, default=120, help='Seconds to wait for server & LB to become ready before running certbot (default: 120)')
 
     return p.parse_args(argv)
 
@@ -278,7 +316,7 @@ if __name__ == '__main__':
         start_server(port=args.port)
     elif args.command == 'cert':
         create_cert(domain=args.domain, email=args.email, webroot=args.webroot, port=args.port,
-                    output_dir=args.output_dir, dry_run=bool(args.dry_run))
+                output_dir=args.output_dir, dry_run=bool(args.dry_run), wait_seconds=int(args.wait_seconds))
     else:
         print('No command provided. Use "server" to run the challenge server or "cert" to obtain a certificate.')
         print('Examples:')
