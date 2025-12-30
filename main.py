@@ -168,46 +168,51 @@ def run_server_in_thread(port: int = 8000):
     return server, thread
 
 
-def wait_for_server(port: int = 8000, timeout: int = 120, interval: float = 2.0) -> bool:
-    """Wait up to `timeout` seconds for localhost:port to accept HTTP connections.
+def wait_for_server(port: int = 8000, timeout: int = 120, interval: float = 2.0, host: str = '127.0.0.1', path: str = '/') -> bool:
+    """Wait up to `timeout` seconds for host:port to accept HTTP connections at `path`.
+
+    This can be used to probe the local backend (127.0.0.1:port) or the public
+    domain (domain:80) so the load balancer has time to detect the backend.
 
     Returns True if the server became reachable within timeout, False otherwise.
     """
     deadline = time.time() + timeout
     logger = logging.getLogger('oci_lb_certbot')
-    logger.info("Waiting up to %ds for server on port %d to become reachable...", timeout, port)
+    logger.info("Waiting up to %ds for %s:%d%s to become reachable...", timeout, host, port, path)
     attempt = 0
+    start_time = time.time()
     while time.time() < deadline:
         attempt += 1
-        elapsed = int(time.time() - (deadline - timeout))
+        elapsed = int(time.time() - start_time)
         try:
-            conn = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
-            conn.request('GET', '/')
+            conn = http.client.HTTPConnection(host, port, timeout=5)
+            conn.request('GET', path)
             resp = conn.getresponse()
-            # Any response (200/404/etc.) indicates the server is up
-            logger.info("Server responded with status %d on attempt %d after %ds; continuing...", resp.status, attempt, elapsed)
+            # Any response (200/404/etc.) indicates the endpoint is reachable
+            logger.info("%s:%d%s responded with status %d on attempt %d after %ds; continuing...", host, port, path, resp.status, attempt, elapsed)
             try:
                 conn.close()
             except Exception:
                 pass
-            # small grace period to let load balancer mark backend healthy
+            # small grace period to allow LB health to finalize
             grace = min(5, timeout)
             if grace > 0:
                 logger.debug("Waiting an additional %ds to allow load balancer to pick up the backend...", grace)
                 time.sleep(grace)
-            logger.info("Server ready after %ds", elapsed)
+            logger.info("Endpoint ready after %ds", elapsed)
             return True
-        except Exception:
+        except Exception as e:
             # Not yet reachable; sleep and retry
-            logger.debug("Attempt %d: server not reachable yet (elapsed %ds)", attempt, int(time.time() - (deadline - timeout)))
+            logger.debug("Attempt %d: %s:%d not reachable yet (%s) (elapsed %ds)", attempt, host, port, e, elapsed)
             time.sleep(interval)
 
-    logger.warning("Timed out after %ds waiting for server on port %d; proceeding anyway.", timeout, port)
+    logger.warning("Timed out after %ds waiting for %s:%d%s; proceeding anyway.", timeout, host, port, path)
     return False
 
 
 def create_cert(domain: str, email: str, webroot: str = '.', port: int = 8000,
-                output_dir: str = './certs', dry_run: bool = False, wait_seconds: int = 120):
+                output_dir: str = './certs', dry_run: bool = False, wait_seconds: int = 120,
+                probe_path: str = '/'):
     """Request certificate from Let's Encrypt using certbot's webroot plugin.
 
     This function will start a temporary HTTP server on `port` to serve
@@ -221,9 +226,14 @@ def create_cert(domain: str, email: str, webroot: str = '.', port: int = 8000,
     print(f"Starting temporary HTTP server on port {port} to serve challenges...")
     server, thread = run_server_in_thread(port=port)
 
-    # Wait for the server/load balancer to become ready (user-configurable)
+    # Wait for the server to be accepting connections locally (small quick check)
     if wait_seconds and wait_seconds > 0:
-        wait_for_server(port=port, timeout=wait_seconds)
+        wait_for_server(port=port, timeout=min(10, wait_seconds), host='127.0.0.1', path='/')
+
+    # If a domain is provided, wait for the load balancer -> backend route to become available
+    if domain and wait_seconds and wait_seconds > 0:
+        # probe the public domain on port 80 using the configured probe_path
+        wait_for_server(port=80, timeout=wait_seconds, host=domain, path=probe_path)
 
     cmd = [
         'certbot', 'certonly',
@@ -339,6 +349,7 @@ def parse_args(argv=None):
     cert.add_argument('--output-dir', '-o', default='./certs', help='Directory to copy certs and store certbot config (default: ./certs)')
     cert.add_argument('--dry-run', action='store_true', help='Pass --dry-run to certbot (test)')
     cert.add_argument('--wait-seconds', type=int, default=120, help='Seconds to wait for server & LB to become ready before running certbot (default: 120)')
+    cert.add_argument('--probe-path', default='/', help='Path to probe on the domain via the load balancer (default: /)')
     cert.add_argument('--lb-ip', '-l', action='append', help='Load balancer IP addresses (can be repeated)')
     cert.add_argument('--verbose', '-v', action='store_true', help='Enable debug logging')
 
@@ -363,7 +374,8 @@ if __name__ == '__main__':
         start_server(port=args.port)
     elif args.command == 'cert':
         create_cert(domain=args.domain, email=args.email, webroot=args.webroot, port=args.port,
-                    output_dir=args.output_dir, dry_run=bool(args.dry_run), wait_seconds=int(args.wait_seconds))
+                output_dir=args.output_dir, dry_run=bool(args.dry_run), wait_seconds=int(args.wait_seconds),
+                probe_path=args.probe_path)
     else:
         print('No command provided. Use "server" to run the challenge server or "cert" to obtain a certificate.')
         print('Examples:')
