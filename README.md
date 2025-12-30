@@ -34,6 +34,8 @@ python3 main.py cert --domain example.com --email you@example.com --port 8000 --
 - Use `--wait-seconds N` to adjust how long the script waits (default 120s) for the backend to become reachable.
 - Add `--lb-ip` flags (repeatable) to declare trusted load balancer IPs that should get an immediate 200 response
   (useful for LB health checks that probe the backend).
+ - Use `--hold` to manually pause after the temporary server is started so you can confirm the LB health checks are green before proceeding.
+   - Optionally pass `--hold-timeout N` to automatically continue after N seconds if you forget to press ENTER.
 
 ---
 
@@ -52,6 +54,8 @@ python3 main.py cert --domain example.com --email you@example.com --port 8000 --
   - `--output-dir, -o` (default `./certs`) — where certs and certbot config/work/logs are stored
   - `--dry-run` pass `--dry-run` to certbot
   - `--wait-seconds` (default 120) wait up to this many seconds for the backend to become reachable
+  - `--hold` pause after the temporary server is started so you can validate LB health (press ENTER to continue)
+  - `--hold-timeout` seconds to automatically continue after the hold (optional)
   - `--lb-ip, -l` (repeatable) declare LB IP(s)
   - `--verbose, -v` enable debug logging
 

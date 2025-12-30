@@ -8,6 +8,7 @@ import threading
 import time
 import logging
 import http.client
+import select
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
@@ -210,9 +211,37 @@ def wait_for_server(port: int = 8000, timeout: int = 120, interval: float = 2.0,
     return False
 
 
+def wait_for_manual_confirmation(timeout: int | None = None):
+    """Wait for the user to press ENTER. If `timeout` is set, wait up to that many seconds.
+
+    Uses `select` on stdin so it does not block forever when a timeout is provided. If
+    stdin is not a TTY, the function returns immediately.
+    """
+    logger = logging.getLogger('oci_lb_certbot')
+    try:
+        if not sys.stdin or not sys.stdin.isatty():
+            logger.warning('stdin is not a TTY; cannot wait for manual confirmation interactively. Continuing.')
+            return
+
+        if timeout is None:
+            input('Press ENTER to continue...')
+            return
+
+        logger.info('Waiting up to %ds for manual confirmation (press ENTER to continue)...', timeout)
+        rlist, _, _ = select.select([sys.stdin], [], [], timeout)
+        if rlist:
+            _ = sys.stdin.readline()
+            logger.info('Manual confirmation received; proceeding.')
+        else:
+            logger.info('Manual confirmation timeout (%ds) reached; proceeding automatically.', timeout)
+    except KeyboardInterrupt:
+        logger.warning('Interrupted during manual hold (Ctrl-C); aborting.')
+        raise
+
+
 def create_cert(domain: str, email: str, webroot: str = '.', port: int = 8000,
                 output_dir: str = './certs', dry_run: bool = False, wait_seconds: int = 120,
-                probe_path: str = '/'):
+                probe_path: str = '/', manual_hold: bool = False, hold_timeout: int | None = None):
     """Request certificate from Let's Encrypt using certbot's webroot plugin.
 
     This function will start a temporary HTTP server on `port` to serve
@@ -234,6 +263,15 @@ def create_cert(domain: str, email: str, webroot: str = '.', port: int = 8000,
     if domain and wait_seconds and wait_seconds > 0:
         # probe the public domain on port 80 using the configured probe_path
         wait_for_server(port=80, timeout=wait_seconds, host=domain, path=probe_path)
+
+    # Optional manual hold for operator validation
+    if manual_hold:
+        logger = logging.getLogger('oci_lb_certbot')
+        logger.info('Manual hold requested. Server is running and serving /.well-known on port %d', port)
+        logger.info('Check the load balancer health check and press ENTER to continue (or Ctrl-C to abort).')
+        if hold_timeout:
+            logger.info('This hold will automatically continue after %ds if no input is received.', hold_timeout)
+        wait_for_manual_confirmation(timeout=hold_timeout)
 
     cmd = [
         'certbot', 'certonly',
@@ -350,6 +388,8 @@ def parse_args(argv=None):
     cert.add_argument('--dry-run', action='store_true', help='Pass --dry-run to certbot (test)')
     cert.add_argument('--wait-seconds', type=int, default=120, help='Seconds to wait for server & LB to become ready before running certbot (default: 120)')
     cert.add_argument('--probe-path', default='/', help='Path to probe on the domain via the load balancer (default: /)')
+    cert.add_argument('--hold', action='store_true', help='Manually hold after starting the temporary server so you can verify LB health (press ENTER to continue)')
+    cert.add_argument('--hold-timeout', type=int, default=None, help='Automatically continue after this many seconds if --hold is used (optional)')
     cert.add_argument('--lb-ip', '-l', action='append', help='Load balancer IP addresses (can be repeated)')
     cert.add_argument('--verbose', '-v', action='store_true', help='Enable debug logging')
 
@@ -375,7 +415,7 @@ if __name__ == '__main__':
     elif args.command == 'cert':
         create_cert(domain=args.domain, email=args.email, webroot=args.webroot, port=args.port,
                 output_dir=args.output_dir, dry_run=bool(args.dry_run), wait_seconds=int(args.wait_seconds),
-                probe_path=args.probe_path)
+                probe_path=args.probe_path, manual_hold=bool(args.hold), hold_timeout=args.hold_timeout)
     else:
         print('No command provided. Use "server" to run the challenge server or "cert" to obtain a certificate.')
         print('Examples:')
