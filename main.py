@@ -1,5 +1,7 @@
 import argparse
 import os
+import shutil
+import json
 import subprocess
 import sys
 import threading
@@ -56,7 +58,8 @@ def run_server_in_thread(port: int = 8000):
     return server, thread
 
 
-def create_cert(domain: str, email: str, webroot: str = '.', port: int = 8000):
+def create_cert(domain: str, email: str, webroot: str = '.', port: int = 8000,
+                output_dir: str = './certs', dry_run: bool = False):
     """Request certificate from Let's Encrypt using certbot's webroot plugin.
 
     This function will start a temporary HTTP server on `port` to serve
@@ -79,10 +82,39 @@ def create_cert(domain: str, email: str, webroot: str = '.', port: int = 8000):
         '--agree-tos',
         '--non-interactive',
     ]
+    if dry_run:
+        cmd.append('--dry-run')
 
     try:
         subprocess.run(cmd, check=True)
         print(f"✓ Certificate obtained for {domain}")
+        # copy generated certs from certbot's default location to output_dir
+        live_dir = Path('/etc/letsencrypt/live') / domain
+        dest = Path(output_dir) / domain
+        dest.mkdir(parents=True, exist_ok=True)
+
+        copied = []
+        for fname in ('fullchain.pem', 'privkey.pem', 'chain.pem', 'cert.pem'):
+            src = live_dir / fname
+            if src.exists():
+                shutil.copy2(src, dest / fname)
+                copied.append(fname)
+
+        if copied:
+            print(f"Copied {', '.join(copied)} to {dest}")
+            # Write a small JSON snippet for LB upload or reference
+            cfg = {
+                'domain': domain,
+                'certificate': str((dest / 'fullchain.pem').resolve()) if (dest / 'fullchain.pem').exists() else None,
+                'private_key': str((dest / 'privkey.pem').resolve()) if (dest / 'privkey.pem').exists() else None,
+                'source_live_dir': str(live_dir),
+            }
+            cfg_path = dest / 'lb-config.json'
+            with open(cfg_path, 'w') as f:
+                json.dump(cfg, f, indent=2)
+            print(f"Wrote LB config to {cfg_path}")
+        else:
+            print(f"Warning: no cert files found in {live_dir}. They may be in a custom certbot directory or certbot failed to place them.")
     finally:
         print("Shutting down temporary HTTP server...")
         server.shutdown()
