@@ -112,7 +112,7 @@ def parse_args(argv=None):
 
     cert = sub.add_parser('cert', help='Obtain certificate with certbot (webroot)')
     cert.add_argument('--domain', '-d', required=True, help='Domain name')
-    cert.add_argument('--email', '-m', required=True, help='Email address for Let's Encrypt')
+    cert.add_argument('--email', '-m', required=True, help="Email address for Let's Encrypt")
     cert.add_argument('--webroot', default='.', help='Webroot path where .well-known is served (default: .)')
     cert.add_argument('--port', type=int, default=8000, help='Backend port the LB forwards to (default: 8000)')
 
