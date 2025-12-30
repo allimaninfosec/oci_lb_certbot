@@ -25,6 +25,13 @@ class ACMEHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         """Serve challenge files from .well-known/acme-challenge/"""
+        # Deny any request that looks like it is trying to access private files
+        deny_patterns = ('/certs', '/letsencrypt', '.pem', '/.git')
+        for p in deny_patterns:
+            if p in self.path:
+                self.send_response(404)
+                self.end_headers()
+                return
         if self.path.startswith('/.well-known/acme-challenge/'):
             file_path = Path('.') / self.path.lstrip('/')
             if file_path.exists():
@@ -45,6 +52,56 @@ class ACMEHandler(SimpleHTTPRequestHandler):
 
 def _ensure_challenge_dir(path: Path = Path('.')):
     (path / '.well-known' / 'acme-challenge').mkdir(parents=True, exist_ok=True)
+
+
+def _is_within(child: Path, parent: Path) -> bool:
+    try:
+        child_res = child.resolve()
+        parent_res = parent.resolve()
+    except Exception:
+        return False
+    return parent_res == child_res or parent_res in child_res.parents
+
+
+def ensure_output_dir_safe(webroot: str, output_dir: str, allow_in_webroot: bool = False) -> Path:
+    """Ensure output_dir exists, is outside of webroot unless allowed, and has secure perms."""
+    webroot_p = Path(webroot).resolve()
+    out_p = Path(output_dir).resolve()
+
+    if _is_within(out_p, webroot_p) and not allow_in_webroot:
+        # Move to parent of webroot to keep it out of public files
+        new_out = webroot_p.parent / 'certs'
+        print(f"Warning: requested output dir {out_p} is inside webroot {webroot_p}. Using {new_out} instead.")
+        out_p = new_out
+
+    out_p.mkdir(parents=True, exist_ok=True)
+    # Lock down directory permissions
+    try:
+        os.chmod(out_p, 0o700)
+    except Exception:
+        # best-effort; continue if OS disallows
+        pass
+
+    return out_p
+
+
+def _secure_cert_files(dest: Path):
+    """Apply secure permissions to cert files and directories in dest."""
+    try:
+        os.chmod(dest, 0o700)
+    except Exception:
+        pass
+
+    for fname in ('privkey.pem', 'fullchain.pem', 'cert.pem', 'chain.pem'):
+        p = dest / fname
+        if p.exists():
+            try:
+                if fname == 'privkey.pem':
+                    os.chmod(p, 0o600)
+                else:
+                    os.chmod(p, 0o644)
+            except Exception:
+                pass
 
 
 def run_server_in_thread(port: int = 8000):
@@ -84,13 +141,28 @@ def create_cert(domain: str, email: str, webroot: str = '.', port: int = 8000,
     ]
     if dry_run:
         cmd.append('--dry-run')
+    # Ensure certbot writes to writable directories under output_dir instead of /etc or /var
+    # ensure output dir is safe (outside webroot by default) and exists
+    out = ensure_output_dir_safe(webroot=webroot, output_dir=output_dir)
+    config_dir = out / 'letsencrypt'
+    work_dir = out / 'letsencrypt-work'
+    logs_dir = out / 'letsencrypt-logs'
+    config_dir.mkdir(parents=True, exist_ok=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd.extend([
+        '--config-dir', str(config_dir),
+        '--work-dir', str(work_dir),
+        '--logs-dir', str(logs_dir),
+    ])
 
     try:
         subprocess.run(cmd, check=True)
         print(f"✓ Certificate obtained for {domain}")
-        # copy generated certs from certbot's default location to output_dir
-        live_dir = Path('/etc/letsencrypt/live') / domain
-        dest = Path(output_dir) / domain
+        # copy generated certs from certbot's config_dir live directory to output_dir
+        live_dir = config_dir / 'live' / domain
+        dest = out / domain
         dest.mkdir(parents=True, exist_ok=True)
 
         copied = []
@@ -113,8 +185,28 @@ def create_cert(domain: str, email: str, webroot: str = '.', port: int = 8000,
             with open(cfg_path, 'w') as f:
                 json.dump(cfg, f, indent=2)
             print(f"Wrote LB config to {cfg_path}")
+            # secure files
+            _secure_cert_files(dest)
         else:
             print(f"Warning: no cert files found in {live_dir}. They may be in a custom certbot directory or certbot failed to place them.")
+
+    # add .gitignore entries to avoid committing certs
+    gitignore = Path('.gitignore')
+    gi_entries = ['# certbot / generated certs', str(out) + '/', '*.pem', 'letsencrypt/', 'letsencrypt-work/', 'letsencrypt-logs/']
+    if gitignore.exists():
+        existing = gitignore.read_text()
+    else:
+        existing = ''
+
+    to_append = []
+    for e in gi_entries:
+        if e not in existing:
+            to_append.append(e)
+
+    if to_append:
+        with open(gitignore, 'a') as f:
+            f.write('\n' + '\n'.join(to_append) + '\n')
+        print(f"Updated .gitignore with {to_append}")
     finally:
         print("Shutting down temporary HTTP server...")
         server.shutdown()
@@ -147,6 +239,8 @@ def parse_args(argv=None):
     cert.add_argument('--email', '-m', required=True, help="Email address for Let's Encrypt")
     cert.add_argument('--webroot', default='.', help='Webroot path where .well-known is served (default: .)')
     cert.add_argument('--port', type=int, default=8000, help='Backend port the LB forwards to (default: 8000)')
+    cert.add_argument('--output-dir', '-o', default='./certs', help='Directory to copy certs and store certbot config (default: ./certs)')
+    cert.add_argument('--dry-run', action='store_true', help='Pass --dry-run to certbot (test)')
 
     return p.parse_args(argv)
 
@@ -157,9 +251,10 @@ if __name__ == '__main__':
     if args.command == 'server':
         start_server(port=args.port)
     elif args.command == 'cert':
-        create_cert(domain=args.domain, email=args.email, webroot=args.webroot, port=args.port)
+        create_cert(domain=args.domain, email=args.email, webroot=args.webroot, port=args.port,
+                    output_dir=args.output_dir, dry_run=bool(args.dry_run))
     else:
         print('No command provided. Use "server" to run the challenge server or "cert" to obtain a certificate.')
         print('Examples:')
         print('  python main.py server --port 8000')
-        print('  python main.py cert --domain example.com --email you@example.com --port 8000')
+        print('  python main.py cert --domain example.com --email you@example.com --port 8000 --output-dir ./certs')
