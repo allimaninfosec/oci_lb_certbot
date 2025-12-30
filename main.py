@@ -190,23 +190,23 @@ def create_cert(domain: str, email: str, webroot: str = '.', port: int = 8000,
         else:
             print(f"Warning: no cert files found in {live_dir}. They may be in a custom certbot directory or certbot failed to place them.")
 
-    # add .gitignore entries to avoid committing certs
-    gitignore = Path('.gitignore')
-    gi_entries = ['# certbot / generated certs', str(out) + '/', '*.pem', 'letsencrypt/', 'letsencrypt-work/', 'letsencrypt-logs/']
-    if gitignore.exists():
-        existing = gitignore.read_text()
-    else:
-        existing = ''
+        # add .gitignore entries to avoid committing certs
+        gitignore = Path('.gitignore')
+        gi_entries = ['# certbot / generated certs', str(out) + '/', '*.pem', 'letsencrypt/', 'letsencrypt-work/', 'letsencrypt-logs/']
+        if gitignore.exists():
+            existing = gitignore.read_text()
+        else:
+            existing = ''
 
-    to_append = []
-    for e in gi_entries:
-        if e not in existing:
-            to_append.append(e)
+        to_append = []
+        for e in gi_entries:
+            if e not in existing:
+                to_append.append(e)
 
-    if to_append:
-        with open(gitignore, 'a') as f:
-            f.write('\n' + '\n'.join(to_append) + '\n')
-        print(f"Updated .gitignore with {to_append}")
+        if to_append:
+            with open(gitignore, 'a') as f:
+                f.write('\n' + '\n'.join(to_append) + '\n')
+            print(f"Updated .gitignore with {to_append}")
     finally:
         print("Shutting down temporary HTTP server...")
         server.shutdown()
