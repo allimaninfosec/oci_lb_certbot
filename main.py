@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import logging
+from logging.handlers import RotatingFileHandler
 import http.client
 import select
 from http.server import HTTPServer, SimpleHTTPRequestHandler
@@ -378,6 +379,7 @@ def parse_args(argv=None):
     srv.add_argument('--port', '-p', type=int, default=8000, help='Port to listen on (default: 8000)')
     srv.add_argument('--lb-ip', '-l', action='append', help='Load balancer IP addresses (can be repeated)')
     srv.add_argument('--verbose', '-v', action='store_true', help='Enable debug logging')
+    srv.add_argument('--log-file', default='./logs/oci_lb_certbot.log', help='Path to write access and debug logs (default: ./logs/oci_lb_certbot.log)')
 
     cert = sub.add_parser('cert', help='Obtain certificate with certbot (webroot)')
     cert.add_argument('--domain', '-d', required=True, help='Domain name')
@@ -392,6 +394,7 @@ def parse_args(argv=None):
     cert.add_argument('--hold-timeout', type=int, default=None, help='Automatically continue after this many seconds if --hold is used (optional)')
     cert.add_argument('--lb-ip', '-l', action='append', help='Load balancer IP addresses (can be repeated)')
     cert.add_argument('--verbose', '-v', action='store_true', help='Enable debug logging')
+    cert.add_argument('--log-file', default='./logs/oci_lb_certbot.log', help='Path to write access and debug logs (default: ./logs/oci_lb_certbot.log)')
 
     return p.parse_args(argv)
 
@@ -401,8 +404,31 @@ if __name__ == '__main__':
 
     # Configure logging
     level = logging.DEBUG if getattr(args, 'verbose', False) else logging.INFO
-    logging.basicConfig(level=level, format='%(asctime)s %(levelname)s %(message)s')
     logger = logging.getLogger('oci_lb_certbot')
+    logger.setLevel(level)
+    # Clear default handlers
+    logger.handlers = []
+
+    # Console handler
+    ch = logging.StreamHandler()
+    ch.setLevel(level)
+    ch.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+    logger.addHandler(ch)
+
+    # File handler (rotating)
+    log_file = getattr(args, 'log_file', None)
+    if log_file:
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(log_path.parent, 0o700)
+        except Exception:
+            pass
+        fh = RotatingFileHandler(str(log_path), maxBytes=5 * 1024 * 1024, backupCount=5)
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+        logger.addHandler(fh)
+        logger.info('Logging to file %s', log_path)
 
     # Set allowed LB IPs on the handler class
     lb_ips = set((args.lb_ip or []) if hasattr(args, 'lb_ip') else [])

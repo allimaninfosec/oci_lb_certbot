@@ -94,12 +94,38 @@ python3 main.py cert --domain example.com --email you@example.com --port 8000 --
 
 ---
 
+## DNS-01 with Cloudflare
+
+If you prefer to use DNS-01 (no need for HTTP challenges or LB changes), the script can invoke certbot's Cloudflare plugin.
+
+1. Create a Cloudflare API Token with "Zone:DNS:Edit" permission for the zone(s) you want to manage.
+2. Use one of two ways:
+  - Provide the token on the CLI (it will be written to a secure credentials file under `--output-dir`):
+
+```bash
+python3 main.py cert --domain example.com --email you@example.com --dns-provider cloudflare --cf-api-token <TOKEN> --output-dir ./certs --dry-run
+```
+
+  - Or provide a credentials file you created beforehand (format: `dns_cloudflare_api_token = <TOKEN>`):
+
+```bash
+python3 main.py cert --domain example.com --email you@example.com --dns-provider cloudflare --cf-credentials-file /path/to/cloudflare.ini --output-dir ./certs --dry-run
+```
+
+Notes:
+- `--dns-propagation-seconds` controls how long certbot waits for DNS propagation (default 60s).
+- The script will write a `cloudflare.ini` file with `600` perms if you pass `--cf-api-token` directly. Keep that file private.
+
+---
+
 ## Logging & troubleshooting
 
 - Use `--verbose`/`-v` for debug logs (includes wait prober attempts and HTTP access logs).
 - The server logs each request with source IP, method, path, status, latency and the `User-Agent` header to help debugging.
 - If certbot reports permissions issues (writing `/var/log/letsencrypt`), re-run using `--output-dir` that is writable by
   the calling user or run the command as a user with write access.
+ - By default access and debug logs are written to `./logs/oci_lb_certbot.log`; change the file with `--log-file /path/to/log`.
+   The logger uses rotation (5 MB files, 5 backups).
 
 ---
 
